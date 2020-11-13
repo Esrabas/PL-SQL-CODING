@@ -1,0 +1,223 @@
+
+--Customers are grouped into investor creditor and transactior customers 
+--in order to identify the segment of customers and see which group affects the volumes.
+
+
+
+
+SELECT BASE.PARTY_ID,---customer id
+       CASE
+          WHEN INVESTOR.PARTY_ID IS NOT NULL
+          THEN
+             (SELECT BEHAVIOURAL_SEGMENT_ID
+                FROM DM.CNF_BEHAVIOURAL_SEGMENT_LKP
+               WHERE BEHAVIOURAL_SEGMENT_CODE = 1)                  --INVESTOR
+          WHEN CREDITOR.PARTY_ID IS NOT NULL
+          THEN
+             (SELECT BEHAVIOURAL_SEGMENT_ID
+                FROM DM.CNF_BEHAVIOURAL_SEGMENT_LKP
+               WHERE BEHAVIOURAL_SEGMENT_CODE = 2)                  --CREDITOR
+          ELSE
+             (SELECT BEHAVIOURAL_SEGMENT_ID
+                FROM DM.CNF_BEHAVIOURAL_SEGMENT_LKP
+               WHERE BEHAVIOURAL_SEGMENT_CODE = 3)                --TRANSACTOR
+       END
+  FROM EDW.PTY_CUSTOMER BASE,
+       (                                                       ----INVESTOR---
+        SELECT   PARTY_ID
+            FROM (  SELECT CIF_ID AS PARTY_ID
+                      FROM ODS_DMP_WR.PAO_SCORES
+                     WHERE     DYNAMIC_LENDING_SCORE <= 0.005
+                           AND DEBT_ESTIMATE >= 5000
+                           AND (   ASSET_ESTIMATE >= 30000
+                                OR VADELI_SCORE >= 0.01
+                                OR (ASSET_ESTIMATE - DEBT_ESTIMATE) >= 20000)
+                           AND YIL_AY <= TO_CHAR (SYSDATE, 'YYYYMM') --ETL_DATE
+                  GROUP BY CIF_ID     
+                  UNION ALL
+                    SELECT EMPLOYEE_PARTY_ID AS PARTY_ID
+                      FROM (  SELECT CLN.DATE_VALUE AS DATA_DATE,
+                                     ST.PARTY_ID AS EMPLOYEE_PARTY_ID,
+                                     AVG (
+                                        CASE
+                                           WHEN ST.TRANSACTION_DATE BETWEEN   ADD_MONTHS (
+                                                                                 CLN.DATE_VALUE,
+                                                                                 -2)
+                                                                            + 1
+                                                                        AND CLN.DATE_VALUE
+                                           THEN
+                                              TRANSACTION_AMOUNT_TL
+                                           ELSE
+                                              0
+                                        END)
+                                        AS LAST_2_MONTHS_AVG_SAL_AMT_TL
+                                FROM EDW.CMN_CALENDAR CLN,
+                                     EDW.PCO_SALARY_TRANSACTION ST,
+                                     EDW.PCO_CORPORATION C,
+                                     EDW.PCO_PAYMENT_TP_LKP LKP,
+                                     EDW.PCO_TRANSACTION_STAT_LKP ST_LKP
+                               WHERE     CLN.DATE_VALUE >=
+                                            ADD_MONTHS (TRUNC (SYSDATE), -24)
+                                     AND CLN.DATE_VALUE < TRUNC (SYSDATE) -- ETL_DATE
+                                     AND ST.TRANSACTION_DATE BETWEEN ADD_MONTHS (
+                                                                        CLN.DATE_VALUE,
+                                                                        -2)
+                                                                 AND CLN.DATE_VALUE
+                                     AND ST.TRANSACTION_STAT_ID =
+                                            ST_LKP.TRANSACTION_STAT_ID
+                                     AND ST_LKP.TRANSACTION_STAT_DESC = 'Ödendi'-----PAÝD
+                                     AND C.SOURCE_SYSTEM_ID = 98
+                                     AND C.CORPORATION_ID = ST.CORPORATION_ID
+                                     AND C.CORPORATION_CODE NOT IN
+                                            ('VEHBIBURS',
+                                             'TEV',
+                                             'ISLEMDSTK1',
+                                             'BILB',
+                                             'VKVBURS',
+                                             'YKB',
+                                             'ISLEMDSTK2',
+                                             'MIM',
+                                             'YKBODEME',
+                                             'CYDD',
+                                             'KOYHIZML',
+                                             'OKMSCY2',
+                                             'TABCAY',
+                                             'KARALICAY',
+                                             'OKMSCY',
+                                             'KK IY ODEM',
+                                             'GURCAY',
+                                             '7696989')
+                                     AND ST.PAYMENT_TP_ID = LKP.PAYMENT_TP_ID
+                                     AND LKP.SOURCE_SYSTEM_ID = 98
+                                     AND LKP.PAYMENT_TP_CODE IN ('M', '4', 'A')
+                            GROUP BY CLN.DATE_VALUE, ST.PARTY_ID)
+                     WHERE LAST_2_MONTHS_AVG_SAL_AMT_TL >= 5000 ----all customer's salary >=5000
+                  GROUP BY EMPLOYEE_PARTY_ID
+                  UNION ALL
+                    SELECT APPLICANT_PARTY_ID AS PARTY_ID
+                      FROM EDW.APP_LOAN_APPLICANT
+                     WHERE TOT_INCOME >= 5000 -- Declared Income>= 5000 
+                  GROUP BY APPLICANT_PARTY_ID                ---EVER 
+                  UNION ALL
+                    SELECT PARTY_ID
+                      FROM DM.MAR_KKB_SUMMARY
+                     WHERE     (KKB_CC_BALANCE >= 10000 OR KKB_CC_AMOUNT >= 15000)
+                           AND DATA_DATE <= TRUNC (SYSDATE)         --ETL_DATE
+                  GROUP BY PARTY_ID                          -- EVER
+                  UNION ALL
+                    SELECT DISTINCT A.CIF_ID AS PARTY_ID
+                      FROM EDW.CON_CREDIT_CARD,
+                           EDW.CON_X_MEDIA, -- kart status
+                           EDW.CON_SOURCE_SYS_STAT_LKP, 
+                           DM.CNF_PRODUCT_GROUP_PRODUCT_REL,
+                           DM.CNF_PRODUCT_GROUP, ----customer's product group 
+                           EDW.PRD_X_PRODUCT_ALL,
+                           EDW.MED_CREDIT_CARD,
+                           DW.CC_TXN A,
+                           LOOKUP.TRX_REASON_LOOKUP B 
+                     WHERE     CON_CREDIT_CARD.CONTRACT_ID =
+                                  CON_X_MEDIA.CONTRACT_ID
+                           AND CON_X_MEDIA.START_DATE <= TRUNC (SYSDATE) -- ETL_DATE
+                           AND CON_X_MEDIA.END_DATE >= TRUNC (SYSDATE) -- ETL_DATE
+                           AND CON_CREDIT_CARD.SOURCE_SYS_STAT_ID =
+                                  CON_SOURCE_SYS_STAT_LKP.SOURCE_SYS_STAT_ID
+                           AND SOURCE_SYS_STAT_CODE NOT IN
+                                  ('AD', 'LE', 'DP', 'LO')
+                           AND CNF_PRODUCT_GROUP_PRODUCT_REL.PRODUCT_GROUP_ID =
+                                  CNF_PRODUCT_GROUP.PRODUCT_GROUP_ID
+                           AND CNF_PRODUCT_GROUP.PRODUCT_GROUP_CODE = 39 -- Individual Credit Cards
+                           AND CNF_PRODUCT_GROUP_PRODUCT_REL.PRODUCT_ID =
+                                  PRD_X_PRODUCT_ALL.BASE
+                           AND PRD_X_PRODUCT_ALL.CHILD_ID =
+                                  CON_CREDIT_CARD.PRODUCT_ID
+                           AND CON_X_MEDIA.MEDIA_ID = MED_CREDIT_CARD.MEDIA_ID
+                           AND A.TRANS_CODE = B.TXN_CODE
+                           AND A.REASON = B.RSN_CODE
+                           AND B.ISLEM_TIPI IN
+                                  ('PURCHASE',
+                                   'REDEMPTION',
+                                   'TAKPURCHASE',
+                                   'VFT PURCHASE')
+                           AND A.POST_DT <= TRUNC (SYSDATE)        -- ETL_DATE
+                           AND A.ACCOUNT = MED_CREDIT_CARD.CC_NK
+                  GROUP BY A.CIF_ID, TO_CHAR (A.POST_DT, 'YYYYMM')
+                    HAVING (SUM (A.TXN_AMT) + (.005 * SUM (A.REDEMP_POINT))) >=
+                              5000                  ---payment above 5000 
+                                  )
+        GROUP BY PARTY_ID) INVESTOR,
+       (                                                          ----CREDITOR
+        SELECT   PARTY_ID
+            FROM (  SELECT A.CIF_ID AS PARTY_ID
+                      FROM EDW.CON_CREDIT_CARD,
+                           EDW.CON_X_MEDIA, 
+                           EDW.CON_SOURCE_SYS_STAT_LKP, 
+                           DM.CNF_PRODUCT_GROUP_PRODUCT_REL,
+                           DM.CNF_PRODUCT_GROUP, 
+                           EDW.PRD_X_PRODUCT_ALL, 
+                           EDW.MED_CREDIT_CARD,
+                           DW.CC_TXN A, 
+                           LOOKUP.TRX_REASON_LOOKUP B 
+                     WHERE     CON_CREDIT_CARD.CONTRACT_ID =
+                                  CON_X_MEDIA.CONTRACT_ID
+                           AND CON_X_MEDIA.START_DATE <= TRUNC (SYSDATE) -- ETL_DATE
+                           AND CON_X_MEDIA.END_DATE >= TRUNC (SYSDATE) -- ETL_DATE
+                           AND CON_CREDIT_CARD.SOURCE_SYS_STAT_ID =
+                                  CON_SOURCE_SYS_STAT_LKP.SOURCE_SYS_STAT_ID
+                           AND SOURCE_SYS_STAT_CODE NOT IN
+                                  ('AD', 'LE', 'DP', 'LO')
+                           AND CNF_PRODUCT_GROUP_PRODUCT_REL.PRODUCT_GROUP_ID =
+                                  CNF_PRODUCT_GROUP.PRODUCT_GROUP_ID
+                           AND CNF_PRODUCT_GROUP.PRODUCT_GROUP_CODE = 39 ---- Individual Credit Cards
+                           AND CNF_PRODUCT_GROUP_PRODUCT_REL.PRODUCT_ID =
+                                  PRD_X_PRODUCT_ALL.BASE
+                           AND PRD_X_PRODUCT_ALL.CHILD_ID =
+                                  CON_CREDIT_CARD.PRODUCT_ID
+                           AND CON_X_MEDIA.MEDIA_ID = MED_CREDIT_CARD.MEDIA_ID
+                           AND A.TRANS_CODE = B.TXN_CODE
+                           AND A.REASON = B.RSN_CODE
+                           AND B.ISLEM_TIPI IN ('CASHADVANCE', 'TNA CASHADVANCE')
+                           AND A.POST_DT <= TRUNC (SYSDATE)        -- ETL_DATE
+                           AND A.ACCOUNT = MED_CREDIT_CARD.CC_NK
+                           AND (A.TXN_AMT + (.005 * A.REDEMP_POINT)) >= 0
+                  GROUP BY A.CIF_ID
+                  UNION ALL
+                    SELECT PARTY_ID
+                      FROM DM.CNF_KKB_CUSTOMER
+                     WHERE     (   OWN_GPL_FLG = 1
+                                OR OWN_CAR_LOAN_FLG = 1
+                                OR OWN_MORTGAGE_FLG = 1)
+                           AND CNF_KKB_CUSTOMER.DATA_DATE <= TRUNC (SYSDATE) --ETL_DATE
+                  GROUP BY PARTY_ID      ---EVER.. KKB Credit Ownerhip
+                  UNION ALL
+                    SELECT PARTY_ID
+                      FROM DM.CNF_CUSTOMER_PRD_SUMMARY_DAILY,
+                           DM.CNF_PRODUCT_GROUP
+                     WHERE     CNF_CUSTOMER_PRD_SUMMARY_DAILY.PRODUCT_GROUP_ID =
+                                  CNF_PRODUCT_GROUP.PRODUCT_GROUP_ID
+                           AND CNF_PRODUCT_GROUP.PRODUCT_GROUP_CODE IN (4, ----Individual consumer Loans
+                                                                          5, ---Car loans
+                                                                            38 --Mortgage Loans
+                                                                              )
+                           AND data_Date <= TRUNC (SYSDATE)         --ETL_DATE
+                           AND OWN_PRODUCT_FLG = 1
+                  GROUP BY PARTY_ID     -- EVER..Credit Ownership
+                  UNION ALL
+                    SELECT CIF_ID AS PARTY_ID
+                      FROM ODS_DMP_WR.PAO_SCORES
+                     WHERE     BIK_SCORE > 0.025
+                           AND YIL_AY <= TO_CHAR (SYSDATE, 'YYYYMM') --ETL_DATE
+                  GROUP BY CIF_ID                            -- Ever 
+                  UNION ALL
+                    SELECT CIF_ID AS PARTY_ID
+                      FROM RFM.CC_TXN_CIF_SUMMARY 
+                     WHERE     (   SEGMENT_2 <> 'BUSINESS USERS'
+                                OR SEGMENT_2 = 'REVOLVING CUSTOMERS')
+                           AND CALC_DATE >= TO_DATE ('20061030', 'YYYYMMDD')
+                           AND CALC_DATE <= TRUNC (SYSDATE)  -- Ever
+                  GROUP BY CIF_ID)
+        GROUP BY PARTY_ID) CREDITOR, EDW.PTY_CUSTOMER_MVT_STAT_LKP
+WHERE     BASE.PARTY_ID = INVESTOR.PARTY_ID(+)
+       AND BASE.PARTY_ID = CREDITOR.PARTY_ID(+)
+       AND PTY_CUSTOMER_MVT_STAT_LKP.MVT_STAT_ID = BASE.MVT_STAT_ID
+       AND BASE.MVT_STAT_CODE = 'A' -- Open
+
